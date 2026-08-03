@@ -126,6 +126,7 @@ enum class BootResume : uint8_t {
   Splash,       // cold boot, flash, panic, or plain reboot
   Silent,       // heap-defrag ESP.restart() (RTC flag; lost on power loss)
   QuickResume,  // wake from a quick-resume deep sleep (SD flag; survives power loss)
+  SkipSplash,   // boot with the splash turned off in settings: no splash, no saved frame either
 };
 
 // Latched true once enterDeepSleep() commits to sleeping, before it tears down
@@ -362,12 +363,21 @@ void setup() {
   // skips the panel-clearing pass and the X3 initial-full-sync arming (see
   // HalDisplay::begin), so the first paint is FAST_REFRESH (~500ms) over the
   // retained frame and input dispatches against a visible UI.
+  // APP_STATE.showBootScreen is the one-shot quick-resume flag (a frame was
+  // saved to restore); SETTINGS.showBootScreen is the user's standing
+  // preference, which suppresses the splash on every boot with nothing to
+  // restore in its place.
   const BootResume resume = isSilentReboot              ? BootResume::Silent
                             : !APP_STATE.showBootScreen ? BootResume::QuickResume
-                                                        : BootResume::Splash;
+                            : SETTINGS.showBootScreen   ? BootResume::Splash
+                                                        : BootResume::SkipSplash;
   bool allowFastInitialReaderRefresh = false;
 
-  setupDisplayAndFonts(resume != BootResume::Splash);
+  // Only the frame-restoring paths init the panel seamlessly. SkipSplash has no
+  // frame to preserve, so it takes the normal clearing init and lets the first
+  // activity paint land as a full refresh — otherwise whatever the panel is
+  // holding would ghost through the fast refresh.
+  setupDisplayAndFonts(resume == BootResume::Silent || resume == BootResume::QuickResume);
 
   switch (resume) {
     case BootResume::Silent:
@@ -396,9 +406,12 @@ void setup() {
         } else {
           renderer.displayBuffer(HalDisplay::HALF_REFRESH);
         }
-      } else {
+      } else if (SETTINGS.showBootScreen) {
         activityManager.goToBoot();  // frame file missing, fall back to the splash
       }
+      break;
+    case BootResume::SkipSplash:
+      // No splash and no frame to restore — the routing block below is the first paint.
       break;
     case BootResume::Splash:
       activityManager.goToBoot();
