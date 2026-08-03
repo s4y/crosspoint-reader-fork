@@ -126,6 +126,7 @@ enum class BootResume : uint8_t {
   Splash,       // cold boot, flash, panic, or plain reboot
   Silent,       // heap-defrag ESP.restart() (RTC flag; lost on power loss)
   QuickResume,  // wake from a quick-resume deep sleep (SD flag; survives power loss)
+  QuietWake,    // wake with Quiet Sleep/Wake on: no boot screen, and no saved frame either
 };
 
 // Latched true once enterDeepSleep() commits to sleeping, before it tears down
@@ -200,7 +201,10 @@ void enterDeepSleep(bool fromTimeout = false) {
       SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::QUICK_RESUME ||
       (fromTimeout &&
        SETTINGS.quickResumeSleepScreen == CrossPointSettings::QUICK_RESUME_SLEEP_SCREEN::QUICK_RESUME_AFTER_TIMEOUT);
-  APP_STATE.showBootScreen = !isQuickResumeSleep;
+  // Quick Resume implies no boot screen (it restores the saved frame instead).
+  // Quiet Sleep/Wake suppresses it on its own, with no frame to restore —
+  // setup() tells the two apart by the presence of SLEEP_FRAME_FILE.
+  APP_STATE.showBootScreen = !isQuickResumeSleep && !SETTINGS.quietSleepWake;
 
   APP_STATE.saveToFile();
 
@@ -211,6 +215,11 @@ void enterDeepSleep(bool fromTimeout = false) {
 
   if (isQuickResumeSleep) {
     saveSleepFrameBuffer();
+  } else {
+    // Drop any frame left behind by an earlier quick-resume sleep that never got
+    // consumed: setup() treats an existing file as "restore this", and a stale one
+    // would paint a screen from a previous session.
+    Storage.remove(SLEEP_FRAME_FILE);
   }
 
   // Tear down WiFi so the modem power domain isn't held alive across deep sleep.
@@ -362,12 +371,21 @@ void setup() {
   // skips the panel-clearing pass and the X3 initial-full-sync arming (see
   // HalDisplay::begin), so the first paint is FAST_REFRESH (~500ms) over the
   // retained frame and input dispatches against a visible UI.
-  const BootResume resume = isSilentReboot              ? BootResume::Silent
-                            : !APP_STATE.showBootScreen ? BootResume::QuickResume
-                                                        : BootResume::Splash;
+  // A suppressed boot screen means either a quick-resume sleep (a frame was
+  // saved to restore) or Quiet Sleep/Wake (nothing saved). The frame file is the
+  // discriminator: only quick resume writes it, and it is consumed on read.
+  const bool hasSleepFrame = !APP_STATE.showBootScreen && Storage.exists(SLEEP_FRAME_FILE);
+  const BootResume resume = isSilentReboot ? BootResume::Silent
+                            : !APP_STATE.showBootScreen
+                                ? (hasSleepFrame ? BootResume::QuickResume : BootResume::QuietWake)
+                                : BootResume::Splash;
   bool allowFastInitialReaderRefresh = false;
 
-  setupDisplayAndFonts(resume != BootResume::Splash);
+  // Only the frame-restoring paths init the panel seamlessly. QuietWake has no
+  // frame to preserve, so it takes the normal clearing init and lets the first
+  // activity paint land as a full refresh — otherwise the sleep screen would
+  // ghost through the fast refresh.
+  setupDisplayAndFonts(resume == BootResume::Silent || resume == BootResume::QuickResume);
 
   switch (resume) {
     case BootResume::Silent:
@@ -397,8 +415,15 @@ void setup() {
           renderer.displayBuffer(HalDisplay::HALF_REFRESH);
         }
       } else {
-        activityManager.goToBoot();  // frame file missing, fall back to the splash
+        activityManager.goToBoot();  // frame file unreadable, fall back to the splash
       }
+      break;
+    case BootResume::QuietWake:
+      // Same one-shot re-arm as QuickResume: the flag only suppresses the boot
+      // screen for this wake, and enterDeepSleep() sets it again next time.
+      APP_STATE.showBootScreen = true;
+      APP_STATE.saveToFile();
+      // No boot screen and no frame restore — the routing block below is the first paint.
       break;
     case BootResume::Splash:
       activityManager.goToBoot();
