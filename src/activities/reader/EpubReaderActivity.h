@@ -106,6 +106,14 @@ class EpubReaderActivity final : public Activity {
   // Set when the lazy extension start failed, so loop() doesn't retry (and log) every
   // tick; the blocking extension in render() remains the fallback past the watermark.
   bool partialRebuildStartFailed = false;
+  // Spine whose build failed outright (a parse error partway through the chapter's HTML),
+  // or -1. Unlike partialRebuildStartFailed this survives section re-creation, because the
+  // failure belongs to the HTML, not to the Section object: a failure resets the section,
+  // the next render builds a fresh one, and without this latch it re-parses the same bytes
+  // and fails at the same place, forever. Cleared by an explicit cache delete or a real
+  // spine change. The chapter still serves the pages the failed build persisted.
+  int failedBuildSpine = -1;
+  bool buildBlockedForSpine() const { return failedBuildSpine == currentSpineIndex; }
 
   // Last position persisted by render()'s saveProgress, used to skip redundant
   // writeAtomic calls on no-op re-renders (menu/bookmark/screenshot).

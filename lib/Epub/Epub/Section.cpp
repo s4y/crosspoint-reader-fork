@@ -430,8 +430,14 @@ bool Section::buildSomeMore(const int maxPages) {
   for (;;) {
     const auto status = build_->parser->parseStep();
     if (status == ChapterHtmlSlimParser::ParseStatus::Error) {
-      LOG_ERR("SCT", "Parse error during incremental build");
-      abandonBuild();
+      // Keep the pages already laid out. The error is deterministic -- it recurs at the
+      // same point in the same HTML every time -- so discarding them (abandonBuild) only
+      // guarantees the next open re-lays out the same prefix and fails at the same byte,
+      // which is what turned a single unparseable chapter into an endless rebuild loop.
+      // Suspending persists the prefix as a partial, so the chapter serves the pages it
+      // does have; the caller is responsible for not re-entering the build.
+      LOG_ERR("SCT", "Parse error during incremental build, keeping %u pages", builtPageCount_);
+      suspendBuild();
       return false;
     }
     if (status == ChapterHtmlSlimParser::ParseStatus::Done) {

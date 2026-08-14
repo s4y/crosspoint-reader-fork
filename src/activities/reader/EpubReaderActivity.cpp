@@ -374,7 +374,7 @@ void EpubReaderActivity::loop() {
   // past the watermark soon. Uses the last render's viewport so pagination matches the
   // partial being extended.
   if (section && !section->isBuilding() && section->isPartial() && !RenderLock::peek() && buildViewportWidth > 0 &&
-      !partialRebuildStartFailed &&
+      !partialRebuildStartFailed && !buildBlockedForSpine() &&
       section->currentPage + PARTIAL_REBUILD_START_MARGIN >= static_cast<int>(section->pageCount)) {
     RenderLock lock;
     // Reuse the last render's viewport so the extension paginates identically to the partial.
@@ -400,7 +400,7 @@ void EpubReaderActivity::loop() {
   // partial's watermark until the build catches up, so the window check would wrongly read
   // "far enough ahead" and stall the build at 0 pages -- then the first turn past the
   // watermark re-parses the whole chapter synchronously. Keep ticking until it finalizes.
-  if (section && section->isBuilding() && !RenderLock::peek() &&
+  if (section && section->isBuilding() && !RenderLock::peek() && !buildBlockedForSpine() &&
       (section->isPartial() || static_cast<int>(section->pageCount) < section->currentPage + BUILD_WINDOW_AHEAD) &&
       buildTickHeapGate()) {
     RenderLock lock;
@@ -413,8 +413,12 @@ void EpubReaderActivity::loop() {
     // cppcheck-suppress knownConditionTrueFalse
     if (section->isBuilding() && buildTickHeapGate()) {
       if (!section->buildSomeMore(BACKGROUND_BUILD_PAGES_PER_TICK)) {
-        LOG_ERR("ERS", "Background section build failed");
-        section.reset();
+        LOG_ERR("ERS", "Background section build failed at %d pages", section->pageCount);
+        failedBuildSpine = currentSpineIndex;
+        // Keep a section that still has pages: the failed build persisted them as a
+        // partial, and dropping it here is what made the reader rebuild from page 0
+        // and fail again on the very next tick.
+        if (section->pageCount == 0) section.reset();
         requestUpdate();
       } else if (section->isBuildComplete() && applyDeferredReposition()) {
         // The chapter re-paginated since the saved progress (settings changed): we now know the
@@ -952,6 +956,9 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
           section.reset();
           epub->clearCache();
           epub->setupCacheDir();
+          // Explicit re-index: give a spine whose build failed another chance (the HTML
+          // cache is gone too, so this genuinely re-reads the book).
+          failedBuildSpine = -1;
           if (!saveProgress(backupSpine, backupPage, backupPageCount)) {
             LOG_ERR("ERS", "Failed to save progress before cache clear");
           }
@@ -1154,6 +1161,25 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     automaticPageTurnActive = false;
   };
 
+  // Common handling for a build that failed partway. Section::buildSomeMore suspends
+  // rather than abandons, so the pages laid out before the failure are still on disk.
+  // Latch the spine (the same HTML fails at the same byte every time, so retrying is
+  // an infinite loop) and keep a section that can still show something. Returns true
+  // when the caller should stop building and render what it has, false when there is
+  // nothing to show and the caller must return.
+  const auto handleBuildFailure = [this, &showBuildError]() -> bool {
+    failedBuildSpine = currentSpineIndex;
+    buildPopupPending = false;
+    if (section && section->pageCount > 0) {
+      LOG_ERR("ERS", "Section build failed, serving the %d pages already built", section->pageCount);
+      return true;
+    }
+    LOG_ERR("ERS", "Section build failed with no pages to show");
+    section.reset();
+    showBuildError();
+    return false;
+  };
+
   // edge case handling for sub-zero spine index
   if (currentSpineIndex < 0) {
     currentSpineIndex = 0;
@@ -1248,7 +1274,14 @@ void EpubReaderActivity::render(RenderLock&& lock) {
         : (pendingPageJump.has_value() || !pendingAnchor.empty() || currentSpineIndex != cachedSpineIndex)
             ? std::nullopt
             : cachedVisibleTextOffset;
-    if (!cacheComplete) {
+    if (!cacheComplete && buildBlockedForSpine()) {
+      // This spine's HTML already failed to parse this session. Re-running the build
+      // would re-read the same bytes and fail at the same one, so serve whatever pages
+      // the failed build persisted; the clamp further down lands the reader on the last
+      // of them.
+      LOG_DBG("ERS", "Build previously failed for spine %d, serving %d cached pages", currentSpineIndex,
+              section->pageCount);
+    } else if (!cacheComplete) {
       if (section->isPartial()) {
         LOG_DBG("ERS", "Partial cache found (%d pages), resuming build...", section->pageCount);
       } else {
@@ -1371,11 +1404,8 @@ void EpubReaderActivity::render(RenderLock&& lock) {
               showBuildPopup();
             }
             if (!section->buildSomeMore(BUILD_PAGES_PER_CHUNK)) {
-              LOG_ERR("ERS", "Failed during incremental section build");
-              section.reset();
-              buildPopupPending = false;
-              showBuildError();
-              return;
+              if (!handleBuildFailure()) return;
+              break;
             }
           }
           buildPopupPending = false;
@@ -1448,25 +1478,26 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   // seconds on a giant spine. Show the indexing popup so it isn't a silent freeze
   // (the page that replaces it takes the HALF ghost-cleanup path). Ordinary window
   // catch-ups on a non-partial build are a page or two and stay popup-free.
-  if (section->isPartial() && section->currentPage >= static_cast<int>(section->pageCount)) {
+  if (section->isPartial() && !buildBlockedForSpine() && section->currentPage >= static_cast<int>(section->pageCount)) {
     GUI.drawPopup(renderer, tr(STR_INDEXING));
     pagesUntilFullRefresh = 1;
   }
-  while (section->isPartial() && section->currentPage >= static_cast<int>(section->pageCount)) {
+  // buildBlockedForSpine() also terminates this loop: without it a failed extension would
+  // leave the section partial with the target still past its watermark, and every iteration
+  // would restart the build that just failed.
+  while (section->isPartial() && !buildBlockedForSpine() &&
+         section->currentPage >= static_cast<int>(section->pageCount)) {
     // Start a build to extend a partial toward the requested page.
     if (!section->isBuilding() && !section->startBuild(renderSpec)) {
       LOG_ERR("ERS", "Failed to start partial extension build");
-      section.reset();
-      showBuildError();
-      return;
+      if (!handleBuildFailure()) return;
+      break;
     }
     // Extend until either the target page exists or the build completes.
     while (!section->isBuildComplete() && section->currentPage >= static_cast<int>(section->pageCount)) {
       if (!section->buildSomeMore(BUILD_PAGES_PER_CHUNK)) {
-        LOG_ERR("ERS", "Failed during incremental section build");
-        section.reset();
-        showBuildError();
-        return;
+        if (!handleBuildFailure()) return;
+        break;
       }
     }
   }
@@ -1474,10 +1505,8 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   if (section->isBuilding()) {
     while (!section->isBuildComplete() && section->currentPage >= static_cast<int>(section->pageCount)) {
       if (!section->buildSomeMore(BUILD_PAGES_PER_CHUNK)) {
-        LOG_ERR("ERS", "Failed during incremental section build");
-        section.reset();
-        showBuildError();
-        return;
+        if (!handleBuildFailure()) return;
+        break;
       }
     }
   }
