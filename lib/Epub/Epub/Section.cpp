@@ -5,6 +5,7 @@
 #include <Memory.h>
 #include <Serialization.h>
 
+#include "CommentStrippingStream.h"
 #include "Epub/css/CssParser.h"
 #include "Page.h"
 #include "hyphenation/Hyphenator.h"
@@ -51,6 +52,13 @@ constexpr uint8_t SECTION_FILE_INCOMPLETE_VERSION = 0;
 // only fails (noisily, via the block-decode error path) when a page is loaded.
 // Derived so the pairing can't be forgotten: 0xFE for v28, 0xFD for v29, ...
 constexpr uint8_t SECTION_FILE_PARTIAL_VERSION = 0xFE - (SECTION_FILE_VERSION - 28);
+// Chapter HTML cache directory. "html2" is the format marker for comment-stripped
+// HTML (see CommentStrippingStream): an unstripped file left by older firmware is
+// exactly the input that fails to parse, so it must never be reused. Stripping does
+// not change pagination, so the .bin layout caches are unaffected.
+std::string htmlCacheDir(const Epub& epub) { return epub.getCachePath() + "/html2"; }
+std::string legacyHtmlCacheDir(const Epub& epub) { return epub.getCachePath() + "/html"; }
+
 constexpr uint32_t HEADER_SIZE = sizeof(uint8_t) + sizeof(int) + sizeof(float) + sizeof(bool) + sizeof(uint8_t) +
                                  sizeof(uint16_t) + sizeof(uint16_t) + sizeof(uint16_t) + sizeof(bool) + sizeof(bool) +
                                  sizeof(uint8_t) + sizeof(bool) + sizeof(uint32_t) + sizeof(uint32_t) +
@@ -261,7 +269,12 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
   }
 
   const auto localPath = epub->getSpineItem(spineIndex).href;
-  const auto htmlDir = epub->getCachePath() + "/html";
+  const auto htmlDir = htmlCacheDir(*epub);
+  const auto legacyHtmlDir = legacyHtmlCacheDir(*epub);
+  if (Storage.exists(legacyHtmlDir.c_str())) {
+    LOG_DBG("SCT", "Removing pre-strip HTML cache %s", legacyHtmlDir.c_str());
+    Storage.removeDir(legacyHtmlDir.c_str());
+  }
   const auto htmlPath = htmlDir + "/" + std::to_string(spineIndex) + ".html";
   const auto tmpHtmlPath = htmlDir + "/.tmp_" + std::to_string(spineIndex) + ".html";
 
@@ -305,7 +318,15 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
       // Larger chunks mean far fewer SD writes inflating the HTML; a 1KB chunk turned a 584KB
       // single-spine novel into ~570 tiny writes (multi-second). 8KB keeps the transient buffers
       // small while cutting the write count 8x.
-      streamed = epub->readItemContentsToStream(localPath, tmpHtml, 8192);
+      // Strip comments on the way in: expat cannot advance past one without buffering
+      // it whole, and a Word-exported chapter's 34KB <!--[if gte mso 9]> blocks push
+      // that buffer past what this heap can hand out mid-build.
+      CommentStrippingStream stripped(tmpHtml);
+      streamed = epub->readItemContentsToStream(localPath, stripped, 8192) && stripped.finish();
+      if (streamed && stripped.failed()) {
+        LOG_ERR("SCT", "Write failed while stripping comments from %s", localPath.c_str());
+        streamed = false;
+      }
       fileSize = tmpHtml.size();
       // Explicitly close() file before calling Storage.remove()
       tmpHtml.close();
@@ -446,7 +467,7 @@ bool Section::buildSomeMore(const int maxPages) {
 }
 
 bool Section::hasHtmlCache() const {
-  const std::string htmlPath = epub->getCachePath() + "/html/" + std::to_string(spineIndex) + ".html";
+  const std::string htmlPath = htmlCacheDir(*epub) + "/" + std::to_string(spineIndex) + ".html";
   return Storage.exists(htmlPath.c_str());
 }
 
